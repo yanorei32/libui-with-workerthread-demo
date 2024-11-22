@@ -1,70 +1,100 @@
 use tokio::runtime;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::{Receiver, Sender};
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
 enum ServerMessage {
-    Update(i32),
+    Died,
 }
 
 #[derive(Debug, Clone)]
 enum UiMessage {
-    ChangeDelta(i32),
+    HeartBeat,
 }
 
 use libui::controls::*;
 use libui::prelude::*;
 
+struct ServerCommunication {
+    tx: Sender<UiMessage>,
+    reverse_rx: Receiver<ServerMessage>,
+}
+
+struct State {
+    server: Option<ServerCommunication>,
+}
+
+async fn server_thread(mut rx: Receiver<UiMessage>, reverse_sender: Sender<ServerMessage>) {
+    loop {
+        match tokio::time::timeout(Duration::from_millis(1000), rx.recv()).await {
+            Ok(_v) => {}
+            Err(_) => {
+                reverse_sender.send(ServerMessage::Died).await.unwrap();
+            }
+        }
+    }
+}
+
 fn main() {
     let ui = UI::init().unwrap();
 
-    let (tx, mut rx) = mpsc::channel(128);
-    let (reverse_tx, mut reverse_rx) = mpsc::channel(128);
+    let state = Rc::new(RefCell::new(State { server: None }));
 
     let rt = runtime::Builder::new_multi_thread()
         .enable_time()
         .build()
         .unwrap();
 
-    rt.spawn(async move {
-        let mut delta = 0;
-        let mut current = 0;
-        let mut interval = tokio::time::interval(Duration::from_millis(50));
-
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    current += delta;
-                    reverse_tx.send(ServerMessage::Update(current)).await.unwrap();
-                }
-                message = rx.recv() => {
-                    let message: UiMessage = message.unwrap();
-                    match message {
-                        UiMessage::ChangeDelta(n) => delta = n,
-                    }
-                }
-            }
-        }
-    });
-
     let mut win = Window::new(&ui, "Example", 300, 200, WindowType::NoMenubar);
     let mut layout = VerticalBox::new();
 
-    let mut slider = Slider::new(-10, 10);
-    slider.set_value(0);
+    let label = Label::new("-");
 
-    slider.on_changed(move |v| {
-        tx.blocking_send(UiMessage::ChangeDelta(v)).unwrap();
+    let mut start = Button::new("Start");
+    let mut heart = Button::new("Heart");
+    heart.disable();
+
+    start.on_clicked({
+        let mut start = start.clone();
+        let s = state.clone();
+        let mut label = label.clone();
+        let mut heart = heart.clone();
+
+        move |_| {
+            let (tx, rx) = mpsc::channel(128);
+            let (reverse_tx, reverse_rx) = mpsc::channel(128);
+
+            label.set_text("おはよう！");
+            s.borrow_mut().server = Some(ServerCommunication { reverse_rx, tx });
+
+            rt.spawn(server_thread(rx, reverse_tx));
+
+            start.disable();
+            heart.enable();
+        }
     });
 
-    let label = Label::new("Hello");
+    heart.on_clicked({
+        let s = state.clone();
 
-    let button = Button::new("Start");
+        move |_| {
+            s.borrow_mut()
+                .server
+                .as_mut()
+                .unwrap()
+                .tx
+                .blocking_send(UiMessage::HeartBeat)
+                .unwrap();
+        }
+    });
 
     layout.append(label.clone(), LayoutStrategy::Stretchy);
-    layout.append(slider, LayoutStrategy::Stretchy);
-    layout.append(button, LayoutStrategy::Stretchy);
+    layout.append(start.clone(), LayoutStrategy::Stretchy);
+    layout.append(heart.clone(), LayoutStrategy::Stretchy);
 
     win.set_child(layout);
     win.show();
@@ -72,11 +102,25 @@ fn main() {
     let mut event_loop = ui.event_loop();
 
     event_loop.on_tick({
+        let state = state.clone();
         let mut label = label.clone();
+        let mut heart = heart.clone();
+        let mut start = start.clone();
         move || {
-            if let Ok(message) = reverse_rx.try_recv() {
+            let state = &mut state.borrow_mut();
+
+            let Some(server) = &mut state.server else {
+                return;
+            };
+
+            if let Ok(message) = &mut server.reverse_rx.try_recv() {
                 match message {
-                    ServerMessage::Update(v) => label.set_text(&format!("{v}")),
+                    ServerMessage::Died => {
+                        state.server = None;
+                        heart.disable();
+                        start.enable();
+                        label.set_text("ぐえー、しんだんご");
+                    }
                 }
             };
         }
